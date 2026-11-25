@@ -1,6 +1,6 @@
 {
   "name": "@numbercutter/nod",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Durable human approval for risky agent actions.",
   "type": "module",
   "license": "MIT",

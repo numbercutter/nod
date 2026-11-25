@@ -10,7 +10,8 @@ const nod = new Nod();
 
 console.log(`process ${process.pid} resuming ${id}`);
 const status = await nod.waitFor(id, { pollMs: 1000 });
-console.log(`decision: ${status}`);
+const record = nod.get(id)!;
+console.log(`decision: ${status}${record.decidedBy ? ` by ${record.decidedBy}` : ""}${record.reason ? ` (${record.reason})` : ""}`);
 if (status !== "approved") process.exit(0);
 
 const outcome = await nod.run(id, ({ idempotencyKey, payload, amount }) => {

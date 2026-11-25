@@ -1,8 +1,9 @@
 import { formatAmount, type Nod, type NodRequest } from "./nod";
+import { verifySlackRequest } from "./slack";
 
-export type ServeOptions = { nod: Nod; port?: number; hostname?: string };
+export type ServeOptions = { nod: Nod; port?: number; hostname?: string; slackSigningSecret?: string; sweepMs?: number };
 
-const MARK = `<svg width="28" height="28" viewBox="0 0 64 64" aria-hidden="true"><path d="M14 0 H46 L64 18 V50 Q64 64 50 64 H14 Q0 64 0 50 V14 Q0 0 14 0 Z" fill="#112553"/><path d="M19 33 L28 42 L45 22" fill="none" stroke="#4ADE80" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const MARK = `<svg width="28" height="28" viewBox="0 0 64 64" aria-hidden="true"><path d="M14 0 H46 L64 18 V50 Q64 64 50 64 H14 Q0 64 0 50 V14 Q0 0 14 0 Z" fill="#0C1A3A" stroke="#2E3A56" stroke-width="1.5"/><path d="M19 33 L28 42 L45 22" fill="none" stroke="#4ADE80" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
 const STYLE = `
 :root { color-scheme: dark; }
@@ -17,9 +18,17 @@ h1 { font-size: 22px; line-height: 1.3; margin: 6px 0 4px; color: #fff; }
 pre { background: #0C1A3A; border-radius: 10px; padding: 14px; overflow-x: auto; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: #B5C3E3; }
 .meta { color: #8396BE; font-size: 13px; margin-top: 16px; }
 form { display: flex; gap: 12px; margin-top: 24px; }
+form.decide { display: block; }
+.buttons { display: flex; gap: 12px; margin-top: 16px; }
 button { flex: 1; font: 700 16px system-ui, sans-serif; padding: 14px; border-radius: 10px; cursor: pointer; border: 2px solid transparent; }
 .approve { background: #4ADE80; color: #0C1A3A; }
 .deny { background: transparent; color: #E2E8F5; border-color: #3A4E7D; }
+textarea { width: 100%; margin-top: 20px; min-height: 64px; background: #0C1A3A; color: #E2E8F5; border: 1px solid #3A4E7D; border-radius: 10px; padding: 10px; font: 14px/1.4 system-ui, sans-serif; }
+label { display: block; margin-top: 20px; color: #B5C3E3; font-size: 13px; }
+label textarea { margin-top: 6px; }
+.votes { margin: 16px 0 0; padding: 0; list-style: none; font-size: 14px; }
+.votes li { padding: 6px 0; border-top: 1px solid #1D3366; }
+.reason { color: #B5C3E3; font-style: italic; }
 button:focus-visible { outline: 3px solid #E2E8F5; outline-offset: 2px; }
 .status { display: inline-block; margin-top: 20px; padding: 6px 12px; border-radius: 999px; font: 700 13px ui-monospace, SFMono-Regular, Menlo, monospace; background: #0C1A3A; }
 .approved { color: #4ADE80; } .denied { color: #F87171; } .expired, .pending { color: #B5C3E3; }
@@ -52,17 +61,63 @@ function details(request: NodRequest): string {
 <h1>${escape(request.summary)}</h1>
 ${amount ? `<div class="amount">${escape(amount)}</div>` : ""}
 ${payload}
-<div class="meta">Requested ${new Date(request.createdAt).toUTCString()}${request.status === "pending" ? ` · expires ${new Date(request.expiresAt).toUTCString()}` : ""}</div>`;
+${votes(request)}
+<div class="meta">Requested ${new Date(request.createdAt).toUTCString()}${request.status === "pending" ? ` · expires ${new Date(request.expiresAt).toUTCString()}${request.onExpiry === "denied" ? ", then denied" : ""}` : ""}</div>`;
+}
+
+function votes(request: NodRequest): string {
+  const approvals = request.votes.filter((vote) => vote.decision === "approved").length;
+  const needs = request.requiredApprovals > 1 ? `<div class="meta">${approvals} of ${request.requiredApprovals} approvals${request.approvers ? ` · approvers: ${request.approvers.map(escape).join(", ")}` : ""}</div>` : request.approvers ? `<div class="meta">approvers: ${request.approvers.map(escape).join(", ")}</div>` : "";
+  const items = request.votes
+    .map((vote) => `<li><span class="${vote.decision}">${vote.decision}</span> by ${escape(vote.approver)}${vote.reason ? ` · <span class="reason">${escape(vote.reason)}</span>` : ""}</li>`)
+    .join("");
+  return `${needs}${items ? `<ul class="votes">${items}</ul>` : ""}`;
 }
 
 function outcome(request: NodRequest): string {
   const by = request.decidedBy ? ` by ${escape(request.decidedBy)}` : "";
   const ran = request.executed ? " · executed" : "";
-  return `<span class="status ${request.status}">${request.status}${request.status === "approved" || request.status === "denied" ? by : ""}${ran}</span>`;
+  const reason = request.reason ? `<p class="reason">${escape(request.reason)}</p>` : "";
+  return `<span class="status ${request.status}">${request.status}${request.status === "approved" || request.status === "denied" ? by : ""}${ran}</span>${reason}`;
+}
+
+async function slackActions(nod: Nod, secret: string | undefined, request: Request): Promise<Response> {
+  if (!secret) return Response.json({ error: "slack_not_configured" }, { status: 404 });
+  const raw = await request.text();
+  const check = verifySlackRequest(secret, request.headers, raw);
+  if (!check.ok) return Response.json({ error: check.reason }, { status: 401 });
+  let payload: any;
+  try {
+    payload = JSON.parse(new URLSearchParams(raw).get("payload") ?? "");
+  } catch {
+    return Response.json({ error: "bad_payload" }, { status: 400 });
+  }
+  const action = payload?.actions?.[0];
+  if (payload?.type !== "block_actions" || !action || (action.action_id !== "nod_approve" && action.action_id !== "nod_deny")) {
+    return new Response(null, { status: 200 });
+  }
+  const user = payload.user ?? {};
+  const name = user.username || user.name || user.id;
+  if (!name) return Response.json({ error: "no_user" }, { status: 400 });
+  const result = await nod.decideAndNotify(String(action.value), action.action_id === "nod_approve" ? "approved" : "denied", {
+    by: `slack:${name}`,
+    aliases: user.id ? [`slack:${user.id}`] : [],
+  });
+  if (!result.ok && typeof payload.response_url === "string") {
+    await fetch(payload.response_url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ response_type: "ephemeral", replace_original: false, text: `nod: ${result.reason.replace(/_/g, " ")}` }),
+    }).catch(() => undefined);
+  }
+  return Response.json({ ok: result.ok, reason: result.ok ? undefined : result.reason, status: result.request?.status });
 }
 
 export function serveApprovals(options: ServeOptions) {
   const { nod } = options;
+  const slackSecret = options.slackSigningSecret ?? process.env.NOD_SLACK_SIGNING_SECRET;
+  const sweeper = setInterval(() => void nod.sweepExpired().catch(() => undefined), options.sweepMs ?? 30_000);
+  sweeper.unref();
   return Bun.serve({
     port: options.port ?? 4747,
     hostname: options.hostname ?? "127.0.0.1",
@@ -87,7 +142,10 @@ export function serveApprovals(options: ServeOptions) {
           }
           return page(
             record.summary,
-            `<div class="card">${details(record)}<form method="post" action="/r/${escape(record.id)}"><input type="hidden" name="t" value="${escape(token)}"><button class="approve" name="decision" value="approve">Approve</button><button class="deny" name="decision" value="deny">Deny</button></form></div>`,
+            `<div class="card">${details(record)}<form class="decide" method="post" action="/r/${escape(record.id)}"><input type="hidden" name="t" value="${escape(token)}">${(() => {
+              const as = nod.linkApprover(record.id, token).approver;
+              return as ? `<div class="meta">Deciding as ${escape(as)}</div>` : "";
+            })()}<label>Reason (optional)<textarea name="reason" maxlength="1000"></textarea></label><div class="buttons"><button class="approve" name="decision" value="approve">Approve</button><button class="deny" name="decision" value="deny">Deny</button></div></form></div>`,
           );
         },
         POST: async (request) => {
@@ -95,9 +153,15 @@ export function serveApprovals(options: ServeOptions) {
           const decision = form.get("decision");
           const token = String(form.get("t") ?? "");
           if (decision !== "approve" && decision !== "deny") return page("Bad request", `<div class="card"><h1>Choose approve or deny.</h1></div>`, 400);
-          const result = nod.decide(request.params.id, decision === "approve" ? "approved" : "denied", { by: "web", token });
+          const reason = String(form.get("reason") ?? "");
+          const result = await nod.decideAndNotify(request.params.id, decision === "approve" ? "approved" : "denied", { by: "web", token, reason });
           if (!result.request) return page("Not found", `<div class="card"><h1>No such request.</h1></div>`, 404);
-          const note = result.ok ? "" : `<p class="meta">${result.reason === "invalid_token" ? "This link is not valid any more." : "This request was already decided."}</p>`;
+          const notes: Record<string, string> = {
+            invalid_token: "This link is not valid any more.",
+            not_an_approver: "This link does not belong to an approver.",
+            already_voted: "You have already decided on this request.",
+          };
+          const note = result.ok ? "" : `<p class="meta">${notes[result.reason] ?? "This request was already decided."}</p>`;
           return page(result.request.summary, `<div class="card">${details(result.request)}${outcome(result.request)}${note}</div>`, result.ok ? 200 : 409);
         },
       },
@@ -105,8 +169,19 @@ export function serveApprovals(options: ServeOptions) {
         GET: (request) => {
           const record = nod.get(request.params.id);
           if (!record) return Response.json({ error: "not_found" }, { status: 404 });
-          return Response.json({ id: record.id, status: record.status, executed: record.executed, decidedBy: record.decidedBy });
+          return Response.json({
+            id: record.id,
+            status: record.status,
+            executed: record.executed,
+            decidedBy: record.decidedBy,
+            reason: record.reason,
+            approvals: record.votes.filter((vote) => vote.decision === "approved").length,
+            requiredApprovals: record.requiredApprovals,
+          });
         },
+      },
+      "/slack/actions": {
+        POST: (request) => slackActions(nod, slackSecret, request),
       },
     },
     fetch: () => page("Not found", `<div class="card"><h1>Not found.</h1></div>`, 404),
